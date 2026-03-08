@@ -2,6 +2,7 @@ package fluxon_test
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	elasticsearch "github.com/elastic/go-elasticsearch/v8"
 	tces "github.com/testcontainers/testcontainers-go/modules/elasticsearch"
 	tckafka "github.com/testcontainers/testcontainers-go/modules/kafka"
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/dropbox/fluxon"
@@ -48,6 +50,8 @@ func (h *e2eHandler) Handle(e *fluxon.Event) (*fluxon.Action, error) {
 type e2eEnv struct {
 	brokers  []string
 	esAddr   string
+	esUser   string
+	esPass   string
 	esClient *elasticsearch.Client
 	produce  func(payload string)
 }
@@ -75,7 +79,7 @@ func setupE2E(t *testing.T) *e2eEnv {
 	ctx := context.Background()
 
 	// Start Kafka
-	kc, err := tckafka.Run(ctx, "apache/kafka-native:3.8.0")
+	kc, err := tckafka.Run(ctx, "confluentinc/confluent-local:7.5.0")
 	if err != nil {
 		t.Skipf("docker unavailable (kafka): %v", err)
 	}
@@ -98,17 +102,23 @@ func setupE2E(t *testing.T) *e2eEnv {
 		Addresses: []string{esAddr},
 		Username:  ec.Settings.Username,
 		Password:  ec.Settings.Password,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Producer
+	// Producer + topic setup
 	producer, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(producer.Close)
+
+	adm := kadm.NewClient(producer)
+	if _, err := adm.CreateTopics(ctx, 1, 1, nil, "cdc.events", "cdc.dlq"); err != nil {
+		t.Fatalf("create topics: %v", err)
+	}
 
 	produce := func(payload string) {
 		results := producer.ProduceSync(ctx, &kgo.Record{
@@ -116,11 +126,18 @@ func setupE2E(t *testing.T) *e2eEnv {
 			Value: []byte(payload),
 		})
 		if err := results.FirstErr(); err != nil {
-			t.Logf("produce warn: %v", err)
+			t.Fatalf("produce failed: %v", err)
 		}
 	}
 
-	return &e2eEnv{brokers: brokers, esAddr: esAddr, esClient: esClient, produce: produce}
+	return &e2eEnv{
+		brokers:  brokers,
+		esAddr:   esAddr,
+		esUser:   ec.Settings.Username,
+		esPass:   ec.Settings.Password,
+		esClient: esClient,
+		produce:  produce,
+	}
 }
 
 func (env *e2eEnv) startEngine(t *testing.T) context.CancelFunc {
@@ -136,6 +153,9 @@ func (env *e2eEnv) startEngine(t *testing.T) context.CancelFunc {
 		},
 		ES: fluxon.ESConfig{
 			Addresses:      []string{env.esAddr},
+			Username:       env.esUser,
+			Password:       env.esPass,
+			InsecureTLS:    true,
 			MaxRetries:     3,
 			RetryBackoffMs: 50,
 		},

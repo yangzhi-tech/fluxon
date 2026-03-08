@@ -180,6 +180,9 @@ type KafkaConfig struct {
 
 type ESConfig struct {
 	Addresses      []string
+	Username       string
+	Password       string
+	InsecureTLS    bool
 	MaxRetries     int
 	RetryBackoffMs int
 }

@@ -4,6 +4,7 @@ package es
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,7 +30,17 @@ type Writer struct {
 
 // NewWriter creates a Writer from ESConfig.
 func NewWriter(cfg types.ESConfig) (*Writer, error) {
-	c, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: cfg.Addresses})
+	esCfg := elasticsearch.Config{
+		Addresses: cfg.Addresses,
+		Username:  cfg.Username,
+		Password:  cfg.Password,
+	}
+	if cfg.InsecureTLS {
+		esCfg.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		}
+	}
+	c, err := elasticsearch.NewClient(esCfg)
 	if err != nil {
 		return nil, err
 	}

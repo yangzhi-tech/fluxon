@@ -175,8 +175,8 @@ func (w *Worker) flushBuffer(ctx context.Context) error {
 
 	var actions []*types.Action
 	for _, e := range entries {
-		if e.Action != nil {
-			actions = append(actions, e.Action.(*types.Action))
+		if a, ok := e.Action.(*types.Action); ok && a != nil {
+			actions = append(actions, a)
 		}
 	}
 
