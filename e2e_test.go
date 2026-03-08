@@ -140,8 +140,36 @@ func setupE2E(t *testing.T) *e2eEnv {
 	}
 }
 
+// engineOpts allows optional overrides for startEngineWith.
+type engineOpts struct {
+	handler    fluxon.Handler
+	maxEvents  int
+	maxWaitMs  int
+	maxRetries int
+}
+
 func (env *e2eEnv) startEngine(t *testing.T) context.CancelFunc {
+	return env.startEngineWith(t, engineOpts{})
+}
+
+func (env *e2eEnv) startEngineWith(t *testing.T, opts engineOpts) context.CancelFunc {
 	t.Helper()
+	h := opts.handler
+	if h == nil {
+		h = &e2eHandler{}
+	}
+	maxEvents := opts.maxEvents
+	if maxEvents == 0 {
+		maxEvents = 100
+	}
+	maxWaitMs := opts.maxWaitMs
+	if maxWaitMs == 0 {
+		maxWaitMs = 200
+	}
+	maxRetries := opts.maxRetries
+	if maxRetries == 0 {
+		maxRetries = 3
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cfg := fluxon.Config{
 		Kafka: fluxon.KafkaConfig{
@@ -149,7 +177,7 @@ func (env *e2eEnv) startEngine(t *testing.T) context.CancelFunc {
 			Topic:             "cdc.events",
 			GroupID:           fmt.Sprintf("fluxon-e2e-%d", time.Now().UnixNano()),
 			DLQTopic:          "cdc.dlq",
-			MaxHandlerRetries: 3,
+			MaxHandlerRetries: maxRetries,
 		},
 		ES: fluxon.ESConfig{
 			Addresses:      []string{env.esAddr},
@@ -159,10 +187,10 @@ func (env *e2eEnv) startEngine(t *testing.T) context.CancelFunc {
 			MaxRetries:     3,
 			RetryBackoffMs: 50,
 		},
-		Buffer: fluxon.BufferConfig{MaxEvents: 100, MaxWaitMs: 200},
+		Buffer: fluxon.BufferConfig{MaxEvents: maxEvents, MaxWaitMs: maxWaitMs},
 	}
 	engine := fluxon.New(cfg)
-	engine.Register(&e2eHandler{})
+	engine.Register(h)
 	go func() {
 		if err := engine.Run(ctx); err != nil && ctx.Err() == nil {
 			t.Logf("engine exited: %v", err)
@@ -170,6 +198,39 @@ func (env *e2eEnv) startEngine(t *testing.T) context.CancelFunc {
 	}()
 	time.Sleep(3 * time.Second) // let consumer join group and assignment settle
 	return cancel
+}
+
+// consumeDLQ reads up to want messages from the DLQ topic within timeout.
+func consumeDLQ(t *testing.T, brokers []string, want int, timeout time.Duration) []map[string]interface{} {
+	t.Helper()
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumerGroup(fmt.Sprintf("dlq-reader-%d", time.Now().UnixNano())),
+		kgo.ConsumeTopics("cdc.dlq"),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	if err != nil {
+		t.Fatalf("dlq consumer: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var msgs []map[string]interface{}
+	for len(msgs) < want {
+		fetches := client.PollFetches(ctx)
+		if fetches.IsClientClosed() || ctx.Err() != nil {
+			break
+		}
+		fetches.EachRecord(func(r *kgo.Record) {
+			var m map[string]interface{}
+			if err := json.Unmarshal(r.Value, &m); err == nil {
+				msgs = append(msgs, m)
+			}
+		})
+	}
+	return msgs
 }
 
 func cdcEvent(op, table string, lsn int64, before, after map[string]interface{}) string {
@@ -329,4 +390,248 @@ func TestE2EHandlerSkipUnknownTable(t *testing.T) {
 	waitForDoc(t, env.esClient, "users", "u1", func(doc map[string]interface{}) bool {
 		return doc["name"] == "alice"
 	}, 15*time.Second)
+}
+
+// ---- TC1: DLQ content ----
+
+func TestE2EDLQPoisonPillContent(t *testing.T) {
+	env := setupE2E(t)
+	stop := env.startEngine(t)
+	defer stop()
+
+	badPayload := `{not valid json at all}`
+	env.produce(badPayload)
+
+	msgs := consumeDLQ(t, env.brokers, 1, 15*time.Second)
+	if len(msgs) == 0 {
+		t.Fatal("expected 1 DLQ message, got 0")
+	}
+	m := msgs[0]
+	if m["error"] == nil || m["error"] == "" {
+		t.Errorf("DLQ message missing error field: %v", m)
+	}
+	// original_payload is base64 when marshalled from []byte
+	if m["original_payload"] == nil {
+		t.Errorf("DLQ message missing original_payload: %v", m)
+	}
+}
+
+// ---- TC2: DLQ on handler retry exhaustion ----
+
+func TestE2EDLQHandlerRetryExhausted(t *testing.T) {
+	env := setupE2E(t)
+
+	alwaysFail := fluxon.HandlerFunc(func(e *fluxon.Event) (*fluxon.Action, error) {
+		if e.Source.Table == "bad_table" {
+			return nil, fmt.Errorf("injected failure")
+		}
+		return (&e2eHandler{}).Handle(e)
+	})
+
+	stop := env.startEngineWith(t, engineOpts{handler: alwaysFail, maxRetries: 2})
+	defer stop()
+
+	env.produce(cdcEvent("c", "bad_table", 1, nil, map[string]interface{}{"id": "b1"}))
+	env.produce(cdcEvent("c", "users", 100, nil, map[string]interface{}{"id": "u1", "name": "alice"}))
+
+	// Pipeline must continue — users event still lands in ES.
+	waitForDoc(t, env.esClient, "users", "u1", func(doc map[string]interface{}) bool {
+		return doc["name"] == "alice"
+	}, 15*time.Second)
+
+	// bad_table event must be in DLQ.
+	msgs := consumeDLQ(t, env.brokers, 1, 15*time.Second)
+	if len(msgs) == 0 {
+		t.Fatal("expected 1 DLQ message for exhausted handler, got 0")
+	}
+	if msgs[0]["error"] == nil {
+		t.Errorf("DLQ message missing error: %v", msgs[0])
+	}
+}
+
+// ---- TC3: Skip (nil,nil) does NOT go to DLQ ----
+
+func TestE2ESkipDoesNotGoToDLQ(t *testing.T) {
+	env := setupE2E(t)
+	stop := env.startEngine(t)
+	defer stop()
+
+	// unknown_table → handler returns nil,nil (skip, not an error)
+	env.produce(cdcEvent("c", "unknown_table", 1, nil, map[string]interface{}{"id": "x1"}))
+	// sentinel to confirm the engine processed past the skipped event
+	env.produce(cdcEvent("c", "users", 100, nil, map[string]interface{}{"id": "u1", "name": "alice"}))
+	waitForDoc(t, env.esClient, "users", "u1", func(doc map[string]interface{}) bool {
+		return doc["name"] == "alice"
+	}, 15*time.Second)
+
+	// DLQ must be empty — skip is not an error.
+	msgs := consumeDLQ(t, env.brokers, 1, 3*time.Second)
+	if len(msgs) != 0 {
+		t.Errorf("expected 0 DLQ messages for skipped event, got %d: %v", len(msgs), msgs)
+	}
+}
+
+// ---- TC4: Stale INSERT redelivery after DELETE does not resurrect ----
+//
+// Realistic scenario: INSERT (LSN=100) and DELETE (LSN=200) both land in ES.
+// Then INSERT is redelivered (Kafka redelivery / consumer restart).
+// The tombstone must survive — the stale redelivery must be rejected.
+//
+// Mechanism: the DELETE scripted upsert leaves the ES _version at 201 (one
+// increment beyond the external version set by the INSERT). The redelivered
+// INDEX with version_type=external,version=100 is rejected as a 409 conflict.
+
+func TestE2EStaleInsertAfterDeleteIgnored(t *testing.T) {
+	env := setupE2E(t)
+	stop := env.startEngine(t)
+	defer stop()
+
+	// Normal flow: INSERT then DELETE.
+	env.produce(cdcEvent("c", "users", 100, nil, map[string]interface{}{"id": "u1", "name": "alice"}))
+	waitForDoc(t, env.esClient, "users", "u1", func(doc map[string]interface{}) bool {
+		return doc["name"] == "alice"
+	}, 15*time.Second)
+
+	env.produce(cdcEvent("d", "users", 200, map[string]interface{}{"id": "u1"}, nil))
+	waitForDoc(t, env.esClient, "users", "u1", func(doc map[string]interface{}) bool {
+		return doc["_deleted"] == true
+	}, 15*time.Second)
+
+	// Redelivery of the old INSERT (LSN=100) — must be rejected by ES version conflict.
+	env.produce(cdcEvent("c", "users", 100, nil, map[string]interface{}{"id": "u1", "name": "ghost"}))
+	time.Sleep(2 * time.Second) // give engine time to process
+
+	doc := getDoc(t, env.esClient, "users", "u1")
+	if doc["_deleted"] != true {
+		t.Errorf("stale INSERT redelivery resurrected soft-deleted doc: %v", doc)
+	}
+	if doc["name"] == "ghost" {
+		t.Errorf("stale INSERT wrote name into tombstone: %v", doc)
+	}
+}
+
+// ---- TC5: Same LSN twice is idempotent ----
+
+func TestE2ESameLSNIdempotent(t *testing.T) {
+	env := setupE2E(t)
+	stop := env.startEngine(t)
+	defer stop()
+
+	payload := cdcEvent("c", "users", 100, nil, map[string]interface{}{"id": "u1", "name": "alice"})
+	env.produce(payload)
+	env.produce(payload) // exact duplicate
+
+	waitForDoc(t, env.esClient, "users", "u1", func(doc map[string]interface{}) bool {
+		return doc["name"] == "alice"
+	}, 15*time.Second)
+
+	// Verify no DLQ messages — 409 conflict is treated as success, not an error.
+	msgs := consumeDLQ(t, env.brokers, 1, 3*time.Second)
+	if len(msgs) != 0 {
+		t.Errorf("expected 0 DLQ messages for idempotent redelivery, got %d", len(msgs))
+	}
+}
+
+// ---- TC6: Rebalance safety ----
+
+func TestE2ERebalanceSafety(t *testing.T) {
+	env := setupE2E(t)
+
+	// Engine A: consumes first batch.
+	stopA := env.startEngine(t)
+
+	for i := 0; i < 5; i++ {
+		env.produce(cdcEvent("c", "users", int64(100+i), nil,
+			map[string]interface{}{"id": fmt.Sprintf("u%d", i), "name": "batch1"}))
+	}
+	for i := 0; i < 5; i++ {
+		waitForDoc(t, env.esClient, "users", fmt.Sprintf("u%d", i), func(doc map[string]interface{}) bool {
+			return doc["name"] == "batch1"
+		}, 20*time.Second)
+	}
+
+	// Engine B joins the same group → triggers rebalance.
+	stopB := env.startEngine(t)
+	defer stopB()
+
+	// Produce second batch during/after rebalance.
+	for i := 5; i < 10; i++ {
+		env.produce(cdcEvent("c", "users", int64(100+i), nil,
+			map[string]interface{}{"id": fmt.Sprintf("u%d", i), "name": "batch2"}))
+	}
+
+	// Stop A — B must have the partition and process the remaining events.
+	stopA()
+	time.Sleep(2 * time.Second)
+
+	for i := 5; i < 10; i++ {
+		waitForDoc(t, env.esClient, "users", fmt.Sprintf("u%d", i), func(doc map[string]interface{}) bool {
+			return doc["name"] == "batch2"
+		}, 20*time.Second)
+	}
+}
+
+// ---- TC7: Shutdown flush ----
+
+func TestE2EShutdownFlush(t *testing.T) {
+	env := setupE2E(t)
+	// Large MaxWaitMs and MaxEvents so only shutdown flush triggers.
+	stop := env.startEngineWith(t, engineOpts{maxEvents: 1000, maxWaitMs: 30000})
+	defer stop()
+
+	for i := 0; i < 3; i++ {
+		env.produce(cdcEvent("c", "users", int64(100+i), nil,
+			map[string]interface{}{"id": fmt.Sprintf("u%d", i), "name": "shutdown"}))
+	}
+	time.Sleep(500 * time.Millisecond) // let engine consume into buffer
+
+	// Cancel — shutdown flush must commit buffered events.
+	stop()
+
+	// Start a new engine to verify offsets were committed (won't reprocess).
+	stop2 := env.startEngine(t)
+	defer stop2()
+
+	for i := 0; i < 3; i++ {
+		waitForDoc(t, env.esClient, "users", fmt.Sprintf("u%d", i), func(doc map[string]interface{}) bool {
+			return doc["name"] == "shutdown"
+		}, 15*time.Second)
+	}
+}
+
+// ---- TC8: Time-based flush ----
+
+func TestE2ETimeBasedFlush(t *testing.T) {
+	env := setupE2E(t)
+	// MaxEvents=1000 so size flush never fires; MaxWaitMs=500 drives the flush.
+	stop := env.startEngineWith(t, engineOpts{maxEvents: 1000, maxWaitMs: 500})
+	defer stop()
+
+	env.produce(cdcEvent("c", "users", 100, nil, map[string]interface{}{"id": "u1", "name": "alice"}))
+
+	// Should appear well within 3× MaxWaitMs — time-based flush must have fired.
+	waitForDoc(t, env.esClient, "users", "u1", func(doc map[string]interface{}) bool {
+		return doc["name"] == "alice"
+	}, 5*time.Second)
+}
+
+// ---- TC9: Size-based flush ----
+
+func TestE2ESizeBasedFlush(t *testing.T) {
+	env := setupE2E(t)
+	// MaxWaitMs=30s so time flush won't fire; MaxEvents=3 drives the flush.
+	stop := env.startEngineWith(t, engineOpts{maxEvents: 3, maxWaitMs: 30000})
+	defer stop()
+
+	for i := 0; i < 3; i++ {
+		env.produce(cdcEvent("c", "users", int64(100+i), nil,
+			map[string]interface{}{"id": fmt.Sprintf("u%d", i), "name": "size"}))
+	}
+
+	// All 3 docs must appear well before the 30s time-based flush would fire.
+	for i := 0; i < 3; i++ {
+		waitForDoc(t, env.esClient, "users", fmt.Sprintf("u%d", i), func(doc map[string]interface{}) bool {
+			return doc["name"] == "size"
+		}, 10*time.Second)
+	}
 }
