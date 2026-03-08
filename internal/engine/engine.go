@@ -1,4 +1,5 @@
-package fluxon
+// Package engine manages the Kafka consumer, partition workers, and rebalance lifecycle.
+package engine
 
 import (
 	"context"
@@ -9,62 +10,73 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/dropbox/fluxon/internal/dlq"
+	"github.com/dropbox/fluxon/internal/es"
+	"github.com/dropbox/fluxon/internal/worker"
+	"github.com/dropbox/fluxon/pkg/types"
 )
 
-// workerIface allows mock injection in engine tests.
-type workerIface interface {
-	submit(r *kgo.Record)
-	flushSync(ctx context.Context) error
-	run(ctx context.Context)
+// WorkerIface allows mock injection in tests.
+type WorkerIface interface {
+	Submit(r *kgo.Record)
+	Flush(ctx context.Context) error
+	Run(ctx context.Context)
 }
 
-// workerFactory creates a workerIface for a given partition.
-type workerFactory func(partition int32) workerIface
+// WorkerFactory creates a WorkerIface for a given partition.
+type WorkerFactory func(partition int32) WorkerIface
 
-// engineImpl holds runtime state for a running Engine.
-type engineImpl struct {
-	cfg     Config
-	handler Handler
-	esw     *esWriter
-	dlqw    dlqWriterIface
+// Engine manages the full pipeline.
+type Engine struct {
+	cfg     types.Config
+	handler types.Handler
+	esw     *es.Writer
+	dlqw    worker.DLQWriter
 
-	factory      workerFactory // nil = production; set in tests
+	factory      WorkerFactory
 	mu           sync.Mutex
-	workers      map[int32]workerIface
+	workers      map[int32]WorkerIface
 	client       *kgo.Client
 	workerCtx    context.Context
 	workerCancel context.CancelFunc
 }
 
-// runEngine is called by Engine.Run.
-func runEngine(ctx context.Context, cfg Config, h Handler) error {
-	esw, err := newESWriter(cfg.ES)
+// New creates a production Engine wired with real ES and DLQ writers.
+func New(cfg types.Config, handler types.Handler) (*Engine, error) {
+	esw, err := es.NewWriter(cfg.ES)
 	if err != nil {
-		return fmt.Errorf("engine: es writer: %w", err)
+		return nil, fmt.Errorf("engine: es writer: %w", err)
 	}
 
-	var dlqAdapter dlqWriterIface
+	var dlqw worker.DLQWriter = &noopDLQ{}
 	if cfg.Kafka.DLQTopic != "" {
 		dw, err := dlq.NewWriter(cfg.Kafka.Brokers, cfg.Kafka.DLQTopic)
 		if err != nil {
-			return fmt.Errorf("engine: dlq writer: %w", err)
+			return nil, fmt.Errorf("engine: dlq writer: %w", err)
 		}
-		dlqAdapter = &dlqWriterAdapter{w: dw}
-	} else {
-		dlqAdapter = &noopDLQWriter{}
+		dlqw = dw
 	}
 
-	e := &engineImpl{
+	return &Engine{
 		cfg:     cfg,
-		handler: h,
+		handler: handler,
 		esw:     esw,
-		dlqw:    dlqAdapter,
-		workers: make(map[int32]workerIface),
-	}
-	return e.run(ctx)
+		dlqw:    dlqw,
+		workers: make(map[int32]WorkerIface),
+	}, nil
 }
 
-func (e *engineImpl) run(ctx context.Context) error {
+// NewWithFactory creates an Engine with a custom worker factory (used in unit tests).
+func NewWithFactory(cfg types.Config, handler types.Handler, factory WorkerFactory) *Engine {
+	return &Engine{
+		cfg:     cfg,
+		handler: handler,
+		factory: factory,
+		workers: make(map[int32]WorkerIface),
+	}
+}
+
+// Run starts the Kafka poll loop and blocks until ctx is cancelled.
+func (e *Engine) Run(ctx context.Context) error {
 	e.workerCtx, e.workerCancel = context.WithCancel(ctx)
 	defer e.workerCancel()
 
@@ -97,7 +109,6 @@ func (e *engineImpl) run(ctx context.Context) error {
 			slog.Error("engine: poll error", "err", err)
 			continue
 		}
-
 		fetches.EachPartition(func(p kgo.FetchTopicPartition) {
 			w := e.getWorker(p.Partition)
 			if w == nil {
@@ -105,26 +116,26 @@ func (e *engineImpl) run(ctx context.Context) error {
 				return
 			}
 			for _, r := range p.Records {
-				w.submit(r)
+				w.Submit(r)
 			}
 		})
 	}
 }
 
-func (e *engineImpl) onAssigned(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
+func (e *Engine) onAssigned(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, partitions := range assigned {
 		for _, p := range partitions {
 			w := e.makeWorker(p)
 			e.workers[p] = w
-			go w.run(e.workerCtx)
+			go w.Run(e.workerCtx)
 			slog.Info("engine: partition assigned", "partition", p)
 		}
 	}
 }
 
-func (e *engineImpl) onRevoked(ctx context.Context, _ *kgo.Client, revoked map[string][]int32) {
+func (e *Engine) onRevoked(ctx context.Context, _ *kgo.Client, revoked map[string][]int32) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, partitions := range revoked {
@@ -133,7 +144,7 @@ func (e *engineImpl) onRevoked(ctx context.Context, _ *kgo.Client, revoked map[s
 			if !ok {
 				continue
 			}
-			if err := w.flushSync(ctx); err != nil {
+			if err := w.Flush(ctx); err != nil {
 				slog.Error("engine: flush on revoke failed", "partition", p, "err", err)
 			}
 			delete(e.workers, p)
@@ -142,13 +153,13 @@ func (e *engineImpl) onRevoked(ctx context.Context, _ *kgo.Client, revoked map[s
 	}
 }
 
-func (e *engineImpl) getWorker(partition int32) workerIface {
+func (e *Engine) getWorker(partition int32) WorkerIface {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.workers[partition]
 }
 
-func (e *engineImpl) makeWorker(partition int32) workerIface {
+func (e *Engine) makeWorker(partition int32) WorkerIface {
 	if e.factory != nil {
 		return e.factory(partition)
 	}
@@ -156,19 +167,10 @@ func (e *engineImpl) makeWorker(partition int32) workerIface {
 	if maxRetries == 0 {
 		maxRetries = 3
 	}
-	return newWorker(
-		partition,
-		e.handler,
-		e.esw,
-		e.dlqw,
-		e.client,
-		maxRetries,
-		e.cfg.Buffer.MaxEvents,
-		e.cfg.Buffer.MaxWaitMs,
-	)
+	return worker.New(partition, e.handler, e.esw, e.dlqw, e.client,
+		maxRetries, e.cfg.Buffer.MaxEvents, e.cfg.Buffer.MaxWaitMs)
 }
 
-// noopDLQWriter discards DLQ messages when no DLQ topic is configured.
-type noopDLQWriter struct{}
+type noopDLQ struct{}
 
-func (n *noopDLQWriter) Send(_ context.Context, _ []byte, _ int32, _ int64, _ error) {}
+func (n *noopDLQ) Send(_ context.Context, _ []byte, _ int32, _ int64, _ error) {}

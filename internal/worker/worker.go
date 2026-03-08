@@ -1,4 +1,5 @@
-package fluxon
+// Package worker provides the per-partition processing goroutine.
+package worker
 
 import (
 	"context"
@@ -8,45 +9,47 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/dropbox/fluxon/internal/buffer"
-	"github.com/dropbox/fluxon/internal/dlq"
+	"github.com/dropbox/fluxon/internal/cdc"
+	"github.com/dropbox/fluxon/pkg/types"
 )
 
-// esWriterIface allows mock injection in worker tests.
-type esWriterIface interface {
-	flush(ctx context.Context, actions []*Action) error
+// ESWriter is the interface satisfied by *es.Writer.
+type ESWriter interface {
+	Flush(ctx context.Context, actions []*types.Action) error
 }
 
-// dlqWriterIface allows mock injection in worker tests.
-type dlqWriterIface interface {
+// DLQWriter is the interface satisfied by *dlq.Writer.
+type DLQWriter interface {
 	Send(ctx context.Context, payload []byte, partition int32, offset int64, reason error)
 }
 
-// commitMarker is satisfied by *kgo.Client.
-type commitMarker interface {
+// CommitMarker is satisfied by *kgo.Client.
+type CommitMarker interface {
 	MarkCommitRecords(records ...*kgo.Record)
 }
 
-// worker processes records for a single Kafka partition sequentially.
-type worker struct {
+// Worker processes records for a single Kafka partition sequentially.
+type Worker struct {
 	partition  int32
 	msgCh      chan *kgo.Record
 	flushCh    chan chan error
 	buf        *buffer.Buffer
-	handler    Handler
-	esw        esWriterIface
-	dlqw       dlqWriterIface
-	client     commitMarker
+	handler    types.Handler
+	esw        ESWriter
+	dlqw       DLQWriter
+	client     CommitMarker
 	maxRetries int
 }
 
-func newWorker(
+// New creates a Worker. Call Run in a goroutine.
+func New(
 	partition int32,
-	handler Handler,
-	esw esWriterIface,
-	dlqw dlqWriterIface,
-	client commitMarker,
+	handler types.Handler,
+	esw ESWriter,
+	dlqw DLQWriter,
+	client CommitMarker,
 	maxRetries, maxEvents, maxWaitMs int,
-) *worker {
+) *Worker {
 	if maxRetries == 0 {
 		maxRetries = 3
 	}
@@ -56,7 +59,7 @@ func newWorker(
 	if maxWaitMs == 0 {
 		maxWaitMs = 500
 	}
-	return &worker{
+	return &Worker{
 		partition:  partition,
 		msgCh:      make(chan *kgo.Record, 256),
 		flushCh:    make(chan chan error, 1),
@@ -69,9 +72,11 @@ func newWorker(
 	}
 }
 
-func (w *worker) submit(r *kgo.Record) { w.msgCh <- r }
+// Submit enqueues a record. Called by the engine poll loop.
+func (w *Worker) Submit(r *kgo.Record) { w.msgCh <- r }
 
-func (w *worker) flushSync(ctx context.Context) error {
+// Flush signals the worker to drain and flush synchronously (used on rebalance).
+func (w *Worker) Flush(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	w.flushCh <- errCh
 	select {
@@ -82,7 +87,8 @@ func (w *worker) flushSync(ctx context.Context) error {
 	}
 }
 
-func (w *worker) run(ctx context.Context) {
+// Run is the worker event loop. Blocks until ctx is cancelled.
+func (w *Worker) Run(ctx context.Context) {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -133,8 +139,8 @@ func (w *worker) run(ctx context.Context) {
 	}
 }
 
-func (w *worker) processRecord(ctx context.Context, record *kgo.Record) {
-	event, err := parseCDC(record.Value)
+func (w *Worker) processRecord(ctx context.Context, record *kgo.Record) {
+	event, err := cdc.Parse(record.Value)
 	if err != nil {
 		slog.Error("cdc parse error", "partition", w.partition, "offset", record.Offset, "err", err)
 		w.dlqw.Send(ctx, record.Value, record.Partition, record.Offset, err)
@@ -142,7 +148,7 @@ func (w *worker) processRecord(ctx context.Context, record *kgo.Record) {
 		return
 	}
 
-	var action *Action
+	var action *types.Action
 	for attempt := 0; attempt <= w.maxRetries; attempt++ {
 		action, err = w.handler.Handle(event)
 		if err == nil {
@@ -161,31 +167,24 @@ func (w *worker) processRecord(ctx context.Context, record *kgo.Record) {
 	w.buf.Add(action, record)
 }
 
-func (w *worker) flushBuffer(ctx context.Context) error {
+func (w *Worker) flushBuffer(ctx context.Context) error {
 	entries := w.buf.Peek()
 	if len(entries) == 0 {
 		return nil
 	}
 
-	var actions []*Action
+	var actions []*types.Action
 	for _, e := range entries {
 		if e.Action != nil {
-			actions = append(actions, e.Action.(*Action))
+			actions = append(actions, e.Action.(*types.Action))
 		}
 	}
 
-	if err := w.esw.flush(ctx, actions); err != nil {
+	if err := w.esw.Flush(ctx, actions); err != nil {
 		return err
 	}
 
 	w.buf.Clear()
 	w.client.MarkCommitRecords(entries[len(entries)-1].Record)
 	return nil
-}
-
-// dlqWriterAdapter wraps *dlq.Writer to satisfy dlqWriterIface.
-type dlqWriterAdapter struct{ w *dlq.Writer }
-
-func (a *dlqWriterAdapter) Send(ctx context.Context, payload []byte, partition int32, offset int64, reason error) {
-	a.w.Send(ctx, payload, partition, offset, reason)
 }

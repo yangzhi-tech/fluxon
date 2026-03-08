@@ -1,4 +1,5 @@
-package fluxon
+// Package es provides an Elasticsearch bulk writer and soft-delete sweeper.
+package es
 
 import (
 	"bytes"
@@ -13,21 +14,22 @@ import (
 
 	elasticsearch "github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esapi"
+
+	"github.com/dropbox/fluxon/pkg/types"
 )
 
 const softDeleteScript = `if (ctx._source._lsn == null || params.lsn > ctx._source._lsn) { ctx._source._deleted = true; ctx._source._lsn = params.lsn; } else { ctx.op = 'none'; }`
 
-// esWriter sends bulk actions to Elasticsearch with exponential-backoff retry.
-type esWriter struct {
-	client     *elasticsearch.Client
-	maxRetries int
-	backoff    time.Duration
+// Writer sends bulk actions to Elasticsearch with exponential-backoff retry.
+type Writer struct {
+	Client     *elasticsearch.Client
+	MaxRetries int
+	Backoff    time.Duration
 }
 
-func newESWriter(cfg ESConfig) (*esWriter, error) {
-	c, err := elasticsearch.NewClient(elasticsearch.Config{
-		Addresses: cfg.Addresses,
-	})
+// NewWriter creates a Writer from ESConfig.
+func NewWriter(cfg types.ESConfig) (*Writer, error) {
+	c, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: cfg.Addresses})
 	if err != nil {
 		return nil, err
 	}
@@ -39,27 +41,27 @@ func newESWriter(cfg ESConfig) (*esWriter, error) {
 	if backoffMs == 0 {
 		backoffMs = 200
 	}
-	return &esWriter{
-		client:     c,
-		maxRetries: maxRetries,
-		backoff:    time.Duration(backoffMs) * time.Millisecond,
+	return &Writer{
+		Client:     c,
+		MaxRetries: maxRetries,
+		Backoff:    time.Duration(backoffMs) * time.Millisecond,
 	}, nil
 }
 
-// flush sends actions as a single _bulk request, retrying on failure.
-func (w *esWriter) flush(ctx context.Context, actions []*Action) error {
+// Flush sends actions as a single _bulk request, retrying on failure.
+func (w *Writer) Flush(ctx context.Context, actions []*types.Action) error {
 	if len(actions) == 0 {
 		return nil
 	}
-	body, err := buildBulkBody(actions)
+	body, err := BuildBulkBody(actions)
 	if err != nil {
 		return fmt.Errorf("es: build bulk body: %w", err)
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= w.maxRetries; attempt++ {
+	for attempt := 0; attempt <= w.MaxRetries; attempt++ {
 		if attempt > 0 {
-			wait := w.backoff * (1 << (attempt - 1))
+			wait := w.Backoff * (1 << (attempt - 1))
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -68,7 +70,7 @@ func (w *esWriter) flush(ctx context.Context, actions []*Action) error {
 		}
 
 		req := esapi.BulkRequest{Body: bytes.NewReader(body)}
-		res, err := req.Do(ctx, w.client)
+		res, err := req.Do(ctx, w.Client)
 		if err != nil {
 			lastErr = fmt.Errorf("es: bulk request: %w", err)
 			slog.Warn("es bulk request failed, retrying", "attempt", attempt, "err", err)
@@ -77,8 +79,8 @@ func (w *esWriter) flush(ctx context.Context, actions []*Action) error {
 		defer res.Body.Close()
 
 		if res.StatusCode >= 500 {
-			bodyBytes, _ := io.ReadAll(res.Body)
-			lastErr = fmt.Errorf("es: server error %d: %s", res.StatusCode, string(bodyBytes))
+			b, _ := io.ReadAll(res.Body)
+			lastErr = fmt.Errorf("es: server error %d: %s", res.StatusCode, string(b))
 			slog.Warn("es bulk 5xx, retrying", "attempt", attempt, "status", res.StatusCode)
 			continue
 		}
@@ -93,7 +95,8 @@ func (w *esWriter) flush(ctx context.Context, actions []*Action) error {
 	return fmt.Errorf("es: retries exhausted: %w", lastErr)
 }
 
-func buildBulkBody(actions []*Action) ([]byte, error) {
+// BuildBulkBody serialises actions into NDJSON bulk format.
+func BuildBulkBody(actions []*types.Action) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 
@@ -102,10 +105,8 @@ func buildBulkBody(actions []*Action) ([]byte, error) {
 		case "index":
 			meta := map[string]interface{}{
 				"index": map[string]interface{}{
-					"_index":       a.Index,
-					"_id":          a.ID,
-					"version":      a.LSN,
-					"version_type": "external",
+					"_index": a.Index, "_id": a.ID,
+					"version": a.LSN, "version_type": "external",
 				},
 			}
 			if err := enc.Encode(meta); err != nil {
@@ -122,10 +123,7 @@ func buildBulkBody(actions []*Action) ([]byte, error) {
 
 		case "delete":
 			meta := map[string]interface{}{
-				"update": map[string]interface{}{
-					"_index": a.Index,
-					"_id":    a.ID,
-				},
+				"update": map[string]interface{}{"_index": a.Index, "_id": a.ID},
 			}
 			if err := enc.Encode(meta); err != nil {
 				return nil, err
@@ -133,14 +131,10 @@ func buildBulkBody(actions []*Action) ([]byte, error) {
 			body := map[string]interface{}{
 				"scripted_upsert": true,
 				"script": map[string]interface{}{
-					"source": softDeleteScript,
-					"lang":   "painless",
+					"source": softDeleteScript, "lang": "painless",
 					"params": map[string]interface{}{"lsn": a.LSN},
 				},
-				"upsert": map[string]interface{}{
-					"_lsn":     a.LSN,
-					"_deleted": true,
-				},
+				"upsert": map[string]interface{}{"_lsn": a.LSN, "_deleted": true},
 			}
 			if err := enc.Encode(body); err != nil {
 				return nil, err
@@ -151,8 +145,8 @@ func buildBulkBody(actions []*Action) ([]byte, error) {
 }
 
 type bulkResponse struct {
-	Errors bool                    `json:"errors"`
-	Items  []map[string]bulkItem  `json:"items"`
+	Errors bool                   `json:"errors"`
+	Items  []map[string]bulkItem `json:"items"`
 }
 
 type bulkItem struct {
@@ -171,19 +165,19 @@ func parseBulkResponse(body io.Reader) error {
 	if !resp.Errors {
 		return nil
 	}
-	var errMsgs []string
+	var msgs []string
 	for _, item := range resp.Items {
 		for _, bi := range item {
 			if bi.Status == http.StatusConflict {
 				continue
 			}
 			if bi.Error != nil {
-				errMsgs = append(errMsgs, fmt.Sprintf("[%d] %s: %s", bi.Status, bi.Error.Type, bi.Error.Reason))
+				msgs = append(msgs, fmt.Sprintf("[%d] %s: %s", bi.Status, bi.Error.Type, bi.Error.Reason))
 			}
 		}
 	}
-	if len(errMsgs) > 0 {
-		return fmt.Errorf("es: bulk item errors: %s", strings.Join(errMsgs, "; "))
+	if len(msgs) > 0 {
+		return fmt.Errorf("es: bulk item errors: %s", strings.Join(msgs, "; "))
 	}
 	return nil
 }

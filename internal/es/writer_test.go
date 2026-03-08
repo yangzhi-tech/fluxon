@@ -1,4 +1,4 @@
-package fluxon
+package es
 
 import (
 	"bytes"
@@ -11,28 +11,28 @@ import (
 	"time"
 
 	elasticsearch "github.com/elastic/go-elasticsearch/v8"
+
+	"github.com/dropbox/fluxon/pkg/types"
 )
 
-// esHandler wraps a handler and injects the required Elastic product header.
-func esTestHandler(next http.Handler) http.Handler {
+func esHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("X-Elastic-Product", "Elasticsearch")
 		next.ServeHTTP(rw, r)
 	})
 }
 
-func newTestESWriter(t *testing.T, handler http.Handler) *esWriter {
+func newTestWriter(t *testing.T, handler http.Handler) *Writer {
 	t.Helper()
-	srv := httptest.NewServer(esTestHandler(handler))
+	srv := httptest.NewServer(esHandler(handler))
 	t.Cleanup(srv.Close)
 	c, err := elasticsearch.NewClient(elasticsearch.Config{
-		Addresses:    []string{srv.URL},
-		DisableRetry: true,
+		Addresses: []string{srv.URL}, DisableRetry: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &esWriter{client: c, maxRetries: 3, backoff: time.Millisecond}
+	return &Writer{Client: c, MaxRetries: 3, Backoff: time.Millisecond}
 }
 
 func ndjsonLines(data []byte) []string {
@@ -46,8 +46,7 @@ func ndjsonLines(data []byte) []string {
 }
 
 func TestBuildBulkBodyIndex(t *testing.T) {
-	actions := []*Action{Index("users", "u1", 100, Doc{"email": "a@b.com"})}
-	body, err := buildBulkBody(actions)
+	body, err := BuildBulkBody([]*types.Action{types.Index("users", "u1", 100, types.Doc{"email": "a@b.com"})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,11 +57,8 @@ func TestBuildBulkBodyIndex(t *testing.T) {
 	var meta map[string]interface{}
 	json.Unmarshal([]byte(lines[0]), &meta)
 	idx := meta["index"].(map[string]interface{})
-	if idx["_index"] != "users" || idx["_id"] != "u1" {
+	if idx["_index"] != "users" || idx["_id"] != "u1" || idx["version_type"] != "external" {
 		t.Errorf("meta mismatch: %v", idx)
-	}
-	if idx["version_type"] != "external" {
-		t.Errorf("version_type=%v", idx["version_type"])
 	}
 	var doc map[string]interface{}
 	json.Unmarshal([]byte(lines[1]), &doc)
@@ -72,8 +68,7 @@ func TestBuildBulkBodyIndex(t *testing.T) {
 }
 
 func TestBuildBulkBodySoftDelete(t *testing.T) {
-	actions := []*Action{SoftDelete("orders", "o1", 200)}
-	body, err := buildBulkBody(actions)
+	body, err := BuildBulkBody([]*types.Action{types.SoftDelete("orders", "o1", 200)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,56 +94,55 @@ func TestBuildBulkBodySoftDelete(t *testing.T) {
 }
 
 func TestBuildBulkBodyMixed(t *testing.T) {
-	actions := []*Action{
-		Index("users", "u1", 1, Doc{}),
-		SoftDelete("orders", "o1", 2),
-		Index("users", "u2", 3, Doc{}),
+	actions := []*types.Action{
+		types.Index("users", "u1", 1, types.Doc{}),
+		types.SoftDelete("orders", "o1", 2),
+		types.Index("users", "u2", 3, types.Doc{}),
 	}
-	body, _ := buildBulkBody(actions)
+	body, _ := BuildBulkBody(actions)
 	if len(ndjsonLines(body)) != 6 {
 		t.Errorf("expected 6 lines, got %d", len(ndjsonLines(body)))
 	}
 }
 
-func TestBuildBulkBodyEmpty(t *testing.T) {
-	w := &esWriter{maxRetries: 1, backoff: time.Millisecond}
-	if err := w.flush(context.Background(), nil); err != nil {
+func TestFlushEmpty(t *testing.T) {
+	w := &Writer{MaxRetries: 1, Backoff: time.Millisecond}
+	if err := w.Flush(context.Background(), nil); err != nil {
 		t.Errorf("expected nil for empty flush, got %v", err)
 	}
 }
 
-func TestESFlushSuccess(t *testing.T) {
-	w := newTestESWriter(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+func TestFlushSuccess(t *testing.T) {
+	w := newTestWriter(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("Content-Type", "application/json")
 		rw.Write([]byte(`{"errors":false,"items":[{"index":{"status":200}}]}`))
 	}))
-	if err := w.flush(context.Background(), []*Action{Index("i", "1", 1, Doc{})}); err != nil {
+	if err := w.Flush(context.Background(), []*types.Action{types.Index("i", "1", 1, types.Doc{})}); err != nil {
 		t.Errorf("expected nil, got %v", err)
 	}
 }
 
-func TestESFlush409TreatedAsSuccess(t *testing.T) {
+func TestFlush409TreatedAsSuccess(t *testing.T) {
 	resp := `{"errors":true,"items":[{"index":{"status":409,"error":{"type":"version_conflict_engine_exception","reason":"conflict"}}}]}`
-	w := newTestESWriter(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+	w := newTestWriter(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		rw.Header().Set("Content-Type", "application/json")
 		rw.Write([]byte(resp))
 	}))
-	if err := w.flush(context.Background(), []*Action{Index("i", "1", 1, Doc{})}); err != nil {
+	if err := w.Flush(context.Background(), []*types.Action{types.Index("i", "1", 1, types.Doc{})}); err != nil {
 		t.Errorf("409 should be success, got %v", err)
 	}
 }
 
-func TestESFlushPerItemErrorRetries(t *testing.T) {
+func TestFlushPerItemErrorRetries(t *testing.T) {
 	calls := 0
 	resp := `{"errors":true,"items":[{"index":{"status":500,"error":{"type":"internal","reason":"oops"}}}]}`
-	w := newTestESWriter(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+	w := newTestWriter(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		calls++
 		rw.Header().Set("Content-Type", "application/json")
 		rw.Write([]byte(resp))
 	}))
-	w.maxRetries = 2
-	err := w.flush(context.Background(), []*Action{Index("i", "1", 1, Doc{})})
-	if err == nil {
+	w.MaxRetries = 2
+	if err := w.Flush(context.Background(), []*types.Action{types.Index("i", "1", 1, types.Doc{})}); err == nil {
 		t.Error("expected error")
 	}
 	if calls != 3 {
@@ -156,15 +150,14 @@ func TestESFlushPerItemErrorRetries(t *testing.T) {
 	}
 }
 
-func TestESFlush5xxRetries(t *testing.T) {
+func TestFlush5xxRetries(t *testing.T) {
 	calls := 0
-	w := newTestESWriter(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+	w := newTestWriter(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		calls++
 		rw.WriteHeader(http.StatusServiceUnavailable)
 	}))
-	w.maxRetries = 2
-	err := w.flush(context.Background(), []*Action{Index("i", "1", 1, Doc{})})
-	if err == nil {
+	w.MaxRetries = 2
+	if err := w.Flush(context.Background(), []*types.Action{types.Index("i", "1", 1, types.Doc{})}); err == nil {
 		t.Error("expected error after 5xx")
 	}
 	if calls != 3 {
@@ -172,16 +165,15 @@ func TestESFlush5xxRetries(t *testing.T) {
 	}
 }
 
-func TestESFlushContextCancellation(t *testing.T) {
-	w := newTestESWriter(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+func TestFlushContextCancellation(t *testing.T) {
+	w := newTestWriter(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		rw.WriteHeader(http.StatusServiceUnavailable)
 	}))
-	w.maxRetries = 100
-	w.backoff = 50 * time.Millisecond
+	w.MaxRetries = 100
+	w.Backoff = 50 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
-	err := w.flush(ctx, []*Action{Index("i", "1", 1, Doc{})})
-	if err == nil {
+	if err := w.Flush(ctx, []*types.Action{types.Index("i", "1", 1, types.Doc{})}); err == nil {
 		t.Error("expected error on context cancellation")
 	}
 }

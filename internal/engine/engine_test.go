@@ -1,4 +1,4 @@
-package fluxon
+package engine
 
 import (
 	"context"
@@ -7,53 +7,49 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
-)
 
-// ---- mock worker ----
+	"github.com/dropbox/fluxon/pkg/types"
+)
 
 type mockWorker struct {
 	mu        sync.Mutex
 	submitted []*kgo.Record
 	flushed   int
-	partition int32
 	runCalled bool
+	partition int32
 }
 
-func (m *mockWorker) submit(r *kgo.Record) {
+func (m *mockWorker) Submit(r *kgo.Record) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.submitted = append(m.submitted, r)
 }
 
-func (m *mockWorker) flushSync(_ context.Context) error {
+func (m *mockWorker) Flush(_ context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.flushed++
 	return nil
 }
 
-func (m *mockWorker) run(_ context.Context) {
+func (m *mockWorker) Run(_ context.Context) {
 	m.mu.Lock()
 	m.runCalled = true
 	m.mu.Unlock()
 }
 
-// ---- engine helpers ----
-
-func newTestEngine(factory workerFactory) *engineImpl {
-	return &engineImpl{
-		cfg:     Config{},
+func newTestEngine(factory WorkerFactory) *Engine {
+	return &Engine{
+		cfg:     types.Config{},
 		factory: factory,
-		workers: make(map[int32]workerIface),
+		workers: make(map[int32]WorkerIface),
 	}
 }
 
-// ---- tests ----
-
-func TestEngineOnAssignedCreatesWorkers(t *testing.T) {
+func TestOnAssignedCreatesWorkers(t *testing.T) {
 	workers := map[int32]*mockWorker{}
 	var mu sync.Mutex
-	factory := func(p int32) workerIface {
+	factory := func(p int32) WorkerIface {
 		w := &mockWorker{partition: p}
 		mu.Lock()
 		workers[p] = w
@@ -73,20 +69,19 @@ func TestEngineOnAssignedCreatesWorkers(t *testing.T) {
 	if n != 3 {
 		t.Errorf("expected 3 workers, got %d", n)
 	}
-	time.Sleep(10 * time.Millisecond) // let goroutines start
+	time.Sleep(10 * time.Millisecond)
 	mu.Lock()
 	for p, w := range workers {
 		if !w.runCalled {
-			t.Errorf("worker for partition %d: run not called", p)
+			t.Errorf("worker for partition %d: Run not called", p)
 		}
 	}
 	mu.Unlock()
 }
 
-func TestEngineOnRevokedFlushesAndRemoves(t *testing.T) {
+func TestOnRevokedFlushesAndRemoves(t *testing.T) {
 	w0 := &mockWorker{partition: 0}
 	w1 := &mockWorker{partition: 1}
-
 	e := newTestEngine(nil)
 	e.workers[0] = w0
 	e.workers[1] = w1
@@ -99,53 +94,42 @@ func TestEngineOnRevokedFlushesAndRemoves(t *testing.T) {
 	e.mu.Unlock()
 
 	if still0 {
-		t.Error("worker 0 should be removed after revoke")
+		t.Error("worker 0 should be removed")
 	}
 	if !still1 {
 		t.Error("worker 1 should remain")
 	}
 	if w0.flushed != 1 {
-		t.Errorf("expected flush called once on revoke, got %d", w0.flushed)
+		t.Errorf("expected 1 flush, got %d", w0.flushed)
 	}
 	if w1.flushed != 0 {
 		t.Error("worker 1 should not be flushed")
 	}
 }
 
-func TestEngineGetWorkerUnknownPartitionNoPanic(t *testing.T) {
+func TestGetWorkerUnknownPartition(t *testing.T) {
 	e := newTestEngine(nil)
-	w := e.getWorker(99)
-	if w != nil {
+	if e.getWorker(99) != nil {
 		t.Error("expected nil for unknown partition")
 	}
 }
 
-func TestEnginePollDispatchRoutesToCorrectWorker(t *testing.T) {
+func TestPollDispatchRoutesToCorrectWorker(t *testing.T) {
 	w0 := &mockWorker{partition: 0}
 	w1 := &mockWorker{partition: 1}
-
 	e := newTestEngine(nil)
 	e.workers[0] = w0
 	e.workers[1] = w1
 
 	r0 := &kgo.Record{Partition: 0}
 	r1 := &kgo.Record{Partition: 1}
+	e.getWorker(0).Submit(r0)
+	e.getWorker(1).Submit(r1)
 
-	// Simulate what the poll loop does.
-	e.getWorker(0).submit(r0)
-	e.getWorker(1).submit(r1)
-
-	w0.mu.Lock()
-	n0 := len(w0.submitted)
-	w0.mu.Unlock()
-	w1.mu.Lock()
-	n1 := len(w1.submitted)
-	w1.mu.Unlock()
-
-	if n0 != 1 || w0.submitted[0] != r0 {
+	if len(w0.submitted) != 1 || w0.submitted[0] != r0 {
 		t.Error("record not routed to worker 0")
 	}
-	if n1 != 1 || w1.submitted[0] != r1 {
+	if len(w1.submitted) != 1 || w1.submitted[0] != r1 {
 		t.Error("record not routed to worker 1")
 	}
 }
