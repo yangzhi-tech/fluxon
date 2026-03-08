@@ -1,5 +1,4 @@
-// Package es provides an Elasticsearch bulk writer with retry logic.
-package es
+package fluxon
 
 import (
 	"bytes"
@@ -14,21 +13,18 @@ import (
 
 	elasticsearch "github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esapi"
-
-	"github.com/dropbox/fluxon"
 )
 
 const softDeleteScript = `if (ctx._source._lsn == null || params.lsn > ctx._source._lsn) { ctx._source._deleted = true; ctx._source._lsn = params.lsn; } else { ctx.op = 'none'; }`
 
-// Writer sends bulk actions to Elasticsearch with exponential-backoff retry.
-type Writer struct {
+// esWriter sends bulk actions to Elasticsearch with exponential-backoff retry.
+type esWriter struct {
 	client     *elasticsearch.Client
 	maxRetries int
 	backoff    time.Duration
 }
 
-// NewWriter creates a Writer from the given config.
-func NewWriter(cfg fluxon.ESConfig) (*Writer, error) {
+func newESWriter(cfg ESConfig) (*esWriter, error) {
 	c, err := elasticsearch.NewClient(elasticsearch.Config{
 		Addresses: cfg.Addresses,
 	})
@@ -43,34 +39,18 @@ func NewWriter(cfg fluxon.ESConfig) (*Writer, error) {
 	if backoffMs == 0 {
 		backoffMs = 200
 	}
-	return &Writer{
+	return &esWriter{
 		client:     c,
 		maxRetries: maxRetries,
 		backoff:    time.Duration(backoffMs) * time.Millisecond,
 	}, nil
 }
 
-// NewWriterWithClient creates a Writer using a pre-built ES client (useful in tests).
-func NewWriterWithClient(client *elasticsearch.Client, maxRetries int, backoffMs int) *Writer {
-	if maxRetries == 0 {
-		maxRetries = 5
-	}
-	if backoffMs == 0 {
-		backoffMs = 200
-	}
-	return &Writer{
-		client:     client,
-		maxRetries: maxRetries,
-		backoff:    time.Duration(backoffMs) * time.Millisecond,
-	}
-}
-
-// Flush sends actions to ES as a single _bulk request, retrying on failure.
-func (w *Writer) Flush(ctx context.Context, actions []*fluxon.Action) error {
+// flush sends actions as a single _bulk request, retrying on failure.
+func (w *esWriter) flush(ctx context.Context, actions []*Action) error {
 	if len(actions) == 0 {
 		return nil
 	}
-
 	body, err := buildBulkBody(actions)
 	if err != nil {
 		return fmt.Errorf("es: build bulk body: %w", err)
@@ -103,21 +83,17 @@ func (w *Writer) Flush(ctx context.Context, actions []*fluxon.Action) error {
 			continue
 		}
 
-		// Parse bulk response to check per-item errors.
 		if err := parseBulkResponse(res.Body); err != nil {
 			lastErr = err
 			slog.Warn("es bulk per-item error, retrying", "attempt", attempt, "err", err)
 			continue
 		}
-
-		return nil // success
+		return nil
 	}
-
 	return fmt.Errorf("es: retries exhausted: %w", lastErr)
 }
 
-// buildBulkBody serialises actions into NDJSON bulk format.
-func buildBulkBody(actions []*fluxon.Action) ([]byte, error) {
+func buildBulkBody(actions []*Action) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 
@@ -171,14 +147,12 @@ func buildBulkBody(actions []*fluxon.Action) ([]byte, error) {
 			}
 		}
 	}
-
 	return buf.Bytes(), nil
 }
 
-// bulkResponse is the top-level ES _bulk response.
 type bulkResponse struct {
-	Errors bool `json:"errors"`
-	Items  []map[string]bulkItem `json:"items"`
+	Errors bool                    `json:"errors"`
+	Items  []map[string]bulkItem  `json:"items"`
 }
 
 type bulkItem struct {
@@ -189,8 +163,6 @@ type bulkItem struct {
 	} `json:"error"`
 }
 
-// parseBulkResponse reads the ES bulk response and returns an error if any
-// non-409 item error is present.
 func parseBulkResponse(body io.Reader) error {
 	var resp bulkResponse
 	if err := json.NewDecoder(body).Decode(&resp); err != nil {
@@ -199,11 +171,10 @@ func parseBulkResponse(body io.Reader) error {
 	if !resp.Errors {
 		return nil
 	}
-
 	var errMsgs []string
 	for _, item := range resp.Items {
 		for _, bi := range item {
-			if bi.Status == http.StatusConflict { // 409 — version conflict, treat as success
+			if bi.Status == http.StatusConflict {
 				continue
 			}
 			if bi.Error != nil {

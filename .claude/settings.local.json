@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go mod init github.com/dropbox/fluxon)",
+      "Read(//usr/local/go/bin/**)",
+      "Read(//opt/homebrew/bin/**)",
+      "Bash(export PATH=$PATH:/opt/homebrew/bin)",
+      "Bash(go version)",
+      "Bash(/opt/homebrew/bin/go version)",
+      "Bash(/usr/local/go/bin/go mod init github.com/dropbox/fluxon)",
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)"
+    ]
+  }
+}

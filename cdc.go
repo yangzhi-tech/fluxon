@@ -1,14 +1,11 @@
-// Package cdc parses Debezium CDC wire-format JSON into public fluxon.Event values.
-package cdc
+package fluxon
 
 import (
 	"encoding/json"
 	"fmt"
-
-	"github.com/dropbox/fluxon"
 )
 
-// rawEvent mirrors the Debezium JSON envelope.
+// rawEvent mirrors the Debezium JSON envelope (never exposed to users).
 type rawEvent struct {
 	Before map[string]interface{} `json:"before"`
 	After  map[string]interface{} `json:"after"`
@@ -20,8 +17,8 @@ type rawEvent struct {
 	Op string `json:"op"`
 }
 
-// Parse deserialises a Debezium JSON payload into a *fluxon.Event.
-func Parse(data []byte) (*fluxon.Event, error) {
+// parseCDC deserialises a Debezium JSON payload into an *Event.
+func parseCDC(data []byte) (*Event, error) {
 	var raw rawEvent
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("cdc: unmarshal: %w", err)
@@ -30,21 +27,19 @@ func Parse(data []byte) (*fluxon.Event, error) {
 		return nil, fmt.Errorf("cdc: missing op field")
 	}
 
-	e := &fluxon.Event{
-		Op: fluxon.Op(raw.Op),
-		Source: fluxon.Source{
+	e := &Event{
+		Op: Op(raw.Op),
+		Source: Source{
 			LSN:    raw.Source.LSN,
 			Table:  raw.Source.Table,
 			Schema: raw.Source.Schema,
 		},
 	}
-
 	if raw.Before != nil {
-		e.Before = fluxon.Row(raw.Before)
+		e.Before = Row(raw.Before)
 	}
 	if raw.After != nil {
-		e.After = fluxon.Row(raw.After)
+		e.After = Row(raw.After)
 	}
-
 	return e, nil
 }

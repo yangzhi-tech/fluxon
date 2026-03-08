@@ -1,5 +1,4 @@
-// Package worker provides the per-partition processing goroutine.
-package worker
+package fluxon
 
 import (
 	"context"
@@ -8,50 +7,46 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"github.com/dropbox/fluxon"
 	"github.com/dropbox/fluxon/internal/buffer"
-	"github.com/dropbox/fluxon/internal/cdc"
+	"github.com/dropbox/fluxon/internal/dlq"
 )
 
-// esWriter is the interface satisfied by *es.Writer.
-type esWriter interface {
-	Flush(ctx context.Context, actions []*fluxon.Action) error
+// esWriterIface allows mock injection in worker tests.
+type esWriterIface interface {
+	flush(ctx context.Context, actions []*Action) error
 }
 
-// dlqWriter is the interface satisfied by *dlq.Writer.
-type dlqWriter interface {
+// dlqWriterIface allows mock injection in worker tests.
+type dlqWriterIface interface {
 	Send(ctx context.Context, payload []byte, partition int32, offset int64, reason error)
 }
 
-// commitMarker is the interface satisfied by *kgo.Client for marking offsets.
+// commitMarker is satisfied by *kgo.Client.
 type commitMarker interface {
 	MarkCommitRecords(records ...*kgo.Record)
 }
 
-// Worker processes records for a single Kafka partition sequentially.
-type Worker struct {
+// worker processes records for a single Kafka partition sequentially.
+type worker struct {
 	partition  int32
-	msgCh      chan *kgo.Record // buffered, capacity 256
-	flushCh    chan chan error   // capacity 1; rebalance flush signal
+	msgCh      chan *kgo.Record
+	flushCh    chan chan error
 	buf        *buffer.Buffer
-	handler    fluxon.Handler
-	esWriter   esWriter
-	dlqWriter  dlqWriter
+	handler    Handler
+	esw        esWriterIface
+	dlqw       dlqWriterIface
 	client     commitMarker
 	maxRetries int
 }
 
-// New creates a Worker. Call Run in a goroutine.
-func New(
+func newWorker(
 	partition int32,
-	handler fluxon.Handler,
-	esw esWriter,
-	dlqw dlqWriter,
+	handler Handler,
+	esw esWriterIface,
+	dlqw dlqWriterIface,
 	client commitMarker,
-	maxRetries int,
-	maxEvents int,
-	maxWaitMs int,
-) *Worker {
+	maxRetries, maxEvents, maxWaitMs int,
+) *worker {
 	if maxRetries == 0 {
 		maxRetries = 3
 	}
@@ -61,27 +56,22 @@ func New(
 	if maxWaitMs == 0 {
 		maxWaitMs = 500
 	}
-	return &Worker{
+	return &worker{
 		partition:  partition,
 		msgCh:      make(chan *kgo.Record, 256),
 		flushCh:    make(chan chan error, 1),
 		buf:        buffer.New(maxEvents, time.Duration(maxWaitMs)*time.Millisecond),
 		handler:    handler,
-		esWriter:   esw,
-		dlqWriter:  dlqw,
+		esw:        esw,
+		dlqw:       dlqw,
 		client:     client,
 		maxRetries: maxRetries,
 	}
 }
 
-// Submit enqueues a record for processing. Called by the engine poll loop.
-func (w *Worker) Submit(r *kgo.Record) {
-	w.msgCh <- r
-}
+func (w *worker) submit(r *kgo.Record) { w.msgCh <- r }
 
-// Flush signals the worker to drain its channel and flush the buffer synchronously.
-// Used by the rebalance handler. Blocks until complete.
-func (w *Worker) Flush(ctx context.Context) error {
+func (w *worker) flushSync(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	w.flushCh <- errCh
 	select {
@@ -92,8 +82,7 @@ func (w *Worker) Flush(ctx context.Context) error {
 	}
 }
 
-// Run is the worker event loop. Runs until ctx is cancelled.
-func (w *Worker) Run(ctx context.Context) {
+func (w *worker) run(ctx context.Context) {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -115,7 +104,6 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 
 		case errCh := <-w.flushCh:
-			// Drain msgCh fully before flushing.
 			for {
 				select {
 				case record := <-w.msgCh:
@@ -128,7 +116,6 @@ func (w *Worker) Run(ctx context.Context) {
 			errCh <- w.flushBuffer(ctx)
 
 		case <-ctx.Done():
-			// Drain and flush on shutdown.
 			for {
 				select {
 				case record := <-w.msgCh:
@@ -146,17 +133,16 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
-// processRecord parses the CDC event, calls the handler, and buffers the result.
-func (w *Worker) processRecord(ctx context.Context, record *kgo.Record) {
-	event, err := cdc.Parse(record.Value)
+func (w *worker) processRecord(ctx context.Context, record *kgo.Record) {
+	event, err := parseCDC(record.Value)
 	if err != nil {
 		slog.Error("cdc parse error", "partition", w.partition, "offset", record.Offset, "err", err)
-		w.dlqWriter.Send(ctx, record.Value, record.Partition, record.Offset, err)
+		w.dlqw.Send(ctx, record.Value, record.Partition, record.Offset, err)
 		w.buf.Add(nil, record)
 		return
 	}
 
-	var action *fluxon.Action
+	var action *Action
 	for attempt := 0; attempt <= w.maxRetries; attempt++ {
 		action, err = w.handler.Handle(event)
 		if err == nil {
@@ -167,34 +153,39 @@ func (w *Worker) processRecord(ctx context.Context, record *kgo.Record) {
 
 	if err != nil {
 		slog.Error("handler exhausted retries", "partition", w.partition, "offset", record.Offset)
-		w.dlqWriter.Send(ctx, record.Value, record.Partition, record.Offset, err)
+		w.dlqw.Send(ctx, record.Value, record.Partition, record.Offset, err)
 		w.buf.Add(nil, record)
 		return
 	}
 
-	// action may be nil (skip)
 	w.buf.Add(action, record)
 }
 
-// flushBuffer sends buffered actions to ES and commits offsets on success.
-func (w *Worker) flushBuffer(ctx context.Context) error {
+func (w *worker) flushBuffer(ctx context.Context) error {
 	entries := w.buf.Peek()
 	if len(entries) == 0 {
 		return nil
 	}
 
-	var actions []*fluxon.Action
+	var actions []*Action
 	for _, e := range entries {
 		if e.Action != nil {
-			actions = append(actions, e.Action.(*fluxon.Action))
+			actions = append(actions, e.Action.(*Action))
 		}
 	}
 
-	if err := w.esWriter.Flush(ctx, actions); err != nil {
+	if err := w.esw.flush(ctx, actions); err != nil {
 		return err
 	}
 
 	w.buf.Clear()
 	w.client.MarkCommitRecords(entries[len(entries)-1].Record)
 	return nil
+}
+
+// dlqWriterAdapter wraps *dlq.Writer to satisfy dlqWriterIface.
+type dlqWriterAdapter struct{ w *dlq.Writer }
+
+func (a *dlqWriterAdapter) Send(ctx context.Context, payload []byte, partition int32, offset int64, reason error) {
+	a.w.Send(ctx, payload, partition, offset, reason)
 }
